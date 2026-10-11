@@ -59,3 +59,14 @@ src-tauri/tauri.conf.qa.json
 
 # Git worktrees
 .worktrees/
+
+# Relay local QA and distribution artifacts
+.relay-test/
+artifacts/
+playwright-report/
+test-results/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+connection.json
+_upstream/

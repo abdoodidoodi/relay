@@ -1,69 +1,32 @@
 [package]
-name = "claude-terminal"
-version = "1.39.0"
+name = "relay"
+version = "0.1.0"
 edition = "2021"
-
+default-run = "relay"
 [features]
 default = []
 devtools = ["tauri/devtools"]
-
 [dependencies]
-tauri = { version = "2", features = ["macos-private-api"] }
-tauri-plugin-process = "2"
-tauri-plugin-store = "2"
+tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-dialog = "2"
-tauri-plugin-clipboard-manager = "2"
-notify-rust = "4"
-tauri-plugin-updater = "2"
-tauri-plugin-deep-link = "2"
-tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
-base64 = "0.22"
-rand = "0.8"
-urlencoding = "2"
+tauri-plugin-single-instance = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 portable-pty = "0.9"
 uuid = { version = "1", features = ["v4"] }
-chrono = { version = "0.4", features = ["serde"] }
+chrono = "0.4"
 rusqlite = { version = "0.40", features = ["bundled"] }
 directories = "6"
-open = "5"
-strip-ansi-escapes = "0.2"
-regex = "1"
-sha2 = "0.10"
-# reqwest 0.13 split the old `rustls-tls` feature into `rustls` (the TLS
-# stack) + an explicit root store; `webpki-roots` keeps the bundled roots
-# behavior 0.12's `rustls-tls` had.
-reqwest = { version = "0.13", features = ["json", "rustls", "webpki-roots"], default-features = false }
-url = "2"
-trash = "5"
+rand = "0.8"
 tiny_http = "0.12"
-zip = { version = "8", default-features = false, features = ["deflate"] }
-flate2 = "1"
-# OS credential store (Windows Credential Manager / macOS Keychain / Linux
-# Secret Service) for API keys. Values never touch SQLite or the WebView.
-keyring = { version = "3", features = ["windows-native", "apple-native", "sync-secret-service"] }
-
-# On Windows, we reach into the underlying CoreWebView2 to disable the
-# default browser context menu (Back/Refresh/Save-as/Inspect) - otherwise
-# right-click → Refresh inside the preview iframe reloads the top-level
-# app and closes every open terminal. Matches the version Tauri already
-# pulls in transitively so nothing extra needs to compile.
-[target.'cfg(target_os = "windows")'.dependencies]
-webview2-com = "0.38"
-windows-core = "0.61"
-# Race mode checks run in a Job Object so a timeout or cancel kills every
-# process the check started, including ones spawned mid-kill. Already in
-# the lock file transitively.
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_JobObjects"] }
-
+reqwest = { version = "0.13", features = ["blocking", "json", "rustls", "webpki-roots"], default-features = false }
+notify-rust = "4"
+libc = "0.2"
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
-
 [dev-dependencies]
 tempfile = "3"
-
 [profile.release]
 lto = true
 opt-level = 3

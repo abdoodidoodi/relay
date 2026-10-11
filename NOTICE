@@ -1,0 +1,16 @@
+Relay is derived from Agentrium (https://github.com/talayash/agentrium)
+Upstream commit: f6586d866d64980484d03e649b25fa1ed827a3ba
+Original copyright (c) 2026 ADE-1. Licensed under MIT; see LICENSE.
+
+Relay contributors' modifications, 2026, are also made available under MIT.
+Relay is an independent fork, not an official Agentrium, Anthropic or OpenAI product.
+
+The active Relay PTY runtime derives lifecycle and streaming patterns from
+Agentrium's terminal.rs, with new durable identity, hooks and state management.
+The frontend, persistence model and background rules are focused replacements.
+Upstream Git history and the original README are preserved for provenance.
+
+Third-party dependencies retain their own licenses. Notable components:
+Tauri (MIT/Apache-2.0), portable-pty (MIT), xterm.js (MIT), React (MIT),
+SQLite (public domain), rusqlite (MIT), Lucide (ISC).
+Agent providers and their CLIs are separately installed and licensed.
