@@ -21,13 +21,32 @@ impl Ledger {
             .optional()
             .map_err(|e| e.to_string())?;
         let missing = raw.is_none();
+        let mut migrate = false;
         let data = match raw {
-            Some(raw) => serde_json::from_str(&raw)
-                .map_err(|e| format!("Relay database is unreadable: {e}"))?,
+            Some(raw) => {
+                let value: serde_json::Value = serde_json::from_str(&raw)
+                    .map_err(|e| format!("Relay database is unreadable: {e}"))?;
+                let old = value.pointer("/settings/setupComplete").is_none();
+                let mut data: LedgerData = serde_json::from_value(value)
+                    .map_err(|e| format!("Relay database is unreadable: {e}"))?;
+                if old {
+                    data.settings.setup_complete = !data.sessions.is_empty();
+                    data.settings.auto_resume = false;
+                    if data.sessions.is_empty()
+                        && data.groups.len() == 1
+                        && data.groups[0].id == "work"
+                        && data.groups[0].title == "Workspace"
+                    {
+                        data.groups[0].title = "Group 1".into();
+                    }
+                    migrate = true;
+                }
+                data
+            }
             None => LedgerData::default(),
         };
         let mut ledger = Self { connection, data };
-        if missing {
+        if missing || migrate {
             ledger.change(|_| Ok(()))?;
         }
         Ok(ledger)
@@ -143,6 +162,8 @@ pub fn add_notification(data: &mut LedgerData, event: &HookEvent) -> Result<Stri
             error: None,
             initial_prompt: format!("Notification from {source}\n\n{title}\n\n{body}"),
             kind: "assistant".into(),
+            shell_integrated: false,
+            shell_cwd: String::new(),
         });
         session_id
     };
@@ -237,5 +258,68 @@ mod tests {
             .change_event(Some("event-2"), |_| Ok(()))
             .unwrap()
             .is_some());
+    }
+    #[test]
+    fn old_workspace_migrates_setup_without_losing_conversations() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("db");
+        let mut ledger = Ledger::open(&path).unwrap();
+        ledger
+            .change(|d| {
+                add_notification(d, &HookEvent::default())?;
+                Ok(())
+            })
+            .unwrap();
+        let sid = ledger.data.sessions[0].id.clone();
+        let mut value = serde_json::to_value(&ledger.data).unwrap();
+        let settings = value.get_mut("settings").unwrap().as_object_mut().unwrap();
+        settings.remove("setupComplete");
+        settings.remove("shellExecutable");
+        ledger
+            .connection
+            .execute(
+                "UPDATE relay_state SET data=?1 WHERE id=1",
+                [value.to_string()],
+            )
+            .unwrap();
+        drop(ledger);
+        let reopened = Ledger::open(&path).unwrap();
+        assert!(reopened.data.settings.setup_complete);
+        assert!(!reopened.data.settings.auto_resume);
+        assert_eq!(reopened.data.sessions[0].id, sid);
+        assert!(!reopened.data.settings.shell_executable.is_empty());
+        assert!(!reopened.data.sessions[0].shell_integrated);
+    }
+    #[test]
+    fn empty_old_default_group_migrates_without_renaming_custom_groups() {
+        for title in ["Workspace", "My work"] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("db");
+            let mut ledger = Ledger::open(&path).unwrap();
+            ledger.data.groups[0].title = title.into();
+            let mut value = serde_json::to_value(&ledger.data).unwrap();
+            value["settings"]
+                .as_object_mut()
+                .unwrap()
+                .remove("setupComplete");
+            ledger
+                .connection
+                .execute(
+                    "UPDATE relay_state SET data=?1 WHERE id=1",
+                    [value.to_string()],
+                )
+                .unwrap();
+            drop(ledger);
+            let reopened = Ledger::open(&path).unwrap();
+            assert!(!reopened.data.settings.setup_complete);
+            assert_eq!(
+                reopened.data.groups[0].title,
+                if title == "Workspace" {
+                    "Group 1"
+                } else {
+                    title
+                }
+            );
+        }
     }
 }

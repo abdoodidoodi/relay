@@ -31,6 +31,10 @@ pub struct Session {
     pub error: Option<String>,
     pub initial_prompt: String,
     pub kind: String,
+    #[serde(default)]
+    pub shell_integrated: bool,
+    #[serde(default)]
+    pub shell_cwd: String,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -69,16 +73,22 @@ pub struct Settings {
     pub close_to_tray: bool,
     pub default_cwd: String,
     pub default_provider: String,
+    #[serde(default)]
+    pub setup_complete: bool,
+    #[serde(default = "default_shell")]
+    pub shell_executable: String,
 }
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            auto_resume: true,
+            auto_resume: false,
             close_to_tray: true,
             default_cwd: directories::BaseDirs::new()
                 .map(|d| d.home_dir().to_string_lossy().into())
                 .unwrap_or_default(),
-            default_provider: "claude".into(),
+            default_provider: "shell".into(),
+            setup_complete: false,
+            shell_executable: default_shell(),
         }
     }
 }
@@ -100,6 +110,10 @@ pub struct LedgerData {
     pub conversation_started: HashSet<String>,
     #[serde(default)]
     pub transcripts: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    pub provider_executables: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    pub provider_homes: std::collections::HashMap<String, String>,
 }
 impl Default for LedgerData {
     fn default() -> Self {
@@ -107,7 +121,7 @@ impl Default for LedgerData {
             version: 0,
             groups: vec![Group {
                 id: "work".into(),
-                title: "Workspace".into(),
+                title: "Group 1".into(),
                 collapsed: false,
             }],
             sessions: vec![],
@@ -119,6 +133,8 @@ impl Default for LedgerData {
             prompted: HashSet::new(),
             conversation_started: HashSet::new(),
             transcripts: Default::default(),
+            provider_executables: Default::default(),
+            provider_homes: Default::default(),
         }
     }
 }
@@ -154,6 +170,13 @@ pub struct CreateSession {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Action {
+    CompleteSetup {
+        cwd: String,
+    },
+    NewTerminal {
+        #[serde(rename = "groupId")]
+        group_id: Option<String>,
+    },
     CreateGroup {
         title: String,
     },
@@ -241,6 +264,24 @@ pub struct HookEvent {
     pub dedupe_key: Option<String>,
     #[serde(default)]
     pub transcript_path: Option<String>,
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub expected_provider_session_id: Option<String>,
+    #[serde(default)]
+    pub provider_turn_id: Option<String>,
+}
+pub fn default_shell() -> String {
+    #[cfg(windows)]
+    {
+        "powershell.exe".into()
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into())
+    }
 }
 pub fn now() -> i64 {
     chrono::Utc::now().timestamp_millis()

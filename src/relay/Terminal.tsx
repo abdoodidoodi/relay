@@ -8,7 +8,7 @@ import type { RelayTransport } from './api';
 import { errorText } from './api';
 import { ReplayGate } from './replay';
 
-export default function Terminal({ sessionId, transport, generation = 0 }: { sessionId: string; transport: RelayTransport; generation?: number }) {
+export default function Terminal({ sessionId, transport, generation = 0, interactive = true }: { sessionId: string; transport: RelayTransport; generation?: number; interactive?: boolean }) {
   const container = useRef<HTMLDivElement>(null);
   const termRef = useRef<XTerm | null>(null);
   const searchRef = useRef<SearchAddon | null>(null);
@@ -32,6 +32,14 @@ export default function Terminal({ sessionId, transport, generation = 0 }: { ses
     const fit = new FitAddon();
     const search = new SearchAddon();
     terminal.loadAddon(fit); terminal.loadAddon(search); terminal.open(container.current);
+    // xterm 5.5 queues viewport synchronization timers without cancelling them
+    // on dispose. Guard that narrow compatibility surface before a fast tab
+    // switch or StrictMode cleanup tears down its renderer.
+    const viewport = (terminal as unknown as { _core?: { viewport?: { syncScrollArea: (immediate?: boolean) => void } } })._core?.viewport;
+    if (viewport && typeof viewport.syncScrollArea === 'function') {
+      const synchronize = viewport.syncScrollArea.bind(viewport);
+      viewport.syncScrollArea = immediate => { if (!disposed) synchronize(immediate); };
+    }
     termRef.current = terminal; searchRef.current = search;
     const gate = new ReplayGate(sessionId, bytes => { if (!disposed) terminal.write(new Uint8Array(bytes)); });
     const report = (e: unknown) => { if (!disposed) setError(errorText(e)); };
@@ -80,6 +88,7 @@ export default function Terminal({ sessionId, transport, generation = 0 }: { ses
   }, [sessionId, transport, generation, retry]);
 
   useEffect(() => { if (query) searchRef.current?.findNext(query, { incremental: true }); }, [query]);
+  useEffect(() => { if (termRef.current) { termRef.current.options.disableStdin = !interactive; termRef.current.options.cursorBlink = interactive; } }, [interactive, generation, retry]);
   return <div className="terminal-shell">
     {searchOpen && <div className="terminal-search"><Search size={14} /><input autoFocus aria-label="Find in terminal" value={query} onChange={event => setQuery(event.target.value)} onKeyDown={event => { if (event.key === 'Enter') { event.preventDefault(); if (event.shiftKey) searchRef.current?.findPrevious(query); else searchRef.current?.findNext(query); } if (event.key === 'Escape') { setSearchOpen(false); termRef.current?.focus(); } }} placeholder="Find in terminal" /><button aria-label="Previous match" onClick={() => searchRef.current?.findPrevious(query)}><ChevronUp size={15} /></button><button aria-label="Next match" onClick={() => searchRef.current?.findNext(query)}><ChevronDown size={15} /></button><button aria-label="Close search" onClick={() => { setSearchOpen(false); termRef.current?.focus(); }}><X size={15} /></button></div>}
     {error && <div className="terminal-error" role="alert"><span>{error}</span><button onClick={() => setRetry(value => value + 1)}>Reconnect</button></div>}

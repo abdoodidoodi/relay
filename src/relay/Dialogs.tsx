@@ -6,7 +6,6 @@ import type { Action, Provider, Rule, Session, Snapshot } from './types';
 
 export type Dispatch = (action: Action) => Promise<Snapshot>;
 export const providerNames: Record<Provider, string> = { claude: 'Claude Code', codex: 'Codex', shell: 'Shell', custom: 'Custom command' };
-export function ProviderOptions() { return <>{Object.entries(providerNames).map(([value, name]) => <option key={value} value={value}>{name}</option>)}</>; }
 export function EffortOptions() { return <><option value="">Provider default</option>{['low', 'medium', 'high', 'xhigh', 'max'].map(e => <option value={e} key={e}>{e}</option>)}</>; }
 export function parseArgs(value: string): string[] {
   const parsed: unknown = JSON.parse(value || '[]');
@@ -41,40 +40,6 @@ export function FolderField({ value, change, required = false }: { value: string
     catch (error) { setError(errorText(error)); }
   };
   return <label>Working folder<div className="folder-field"><input value={value} onChange={e => change(e.target.value)} placeholder="Choose a local project folder" required={required} /><button type="button" aria-label="Choose folder" disabled={!isNative} onClick={() => void pick()} title={isNative ? 'Browse folders' : 'Folder picker requires the desktop app'}><FolderOpen size={16} /></button></div>{error && <span className="field-error">{error}</span>}</label>;
-}
-
-export function NewSession({ snapshot, dispatch, close, created }: { snapshot: Snapshot; dispatch: Dispatch; close: () => void; created: (id: string) => void }) {
-  const [groupId, setGroup] = useState(snapshot.groups[0]?.id || '');
-  const [title, setTitle] = useState('');
-  const [provider, setProvider] = useState<Provider>(snapshot.settings.defaultProvider);
-  const [cwd, setCwd] = useState(snapshot.settings.defaultCwd);
-  const [model, setModel] = useState('');
-  const [effort, setEffort] = useState('');
-  const [executable, setExecutable] = useState('');
-  const [args, setArgs] = useState('[]');
-  const [prompt, setPrompt] = useState('');
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState('');
-  async function submit(event: FormEvent) {
-    event.preventDefault(); setBusy(true); setError('');
-    try {
-      const parsed = provider === 'custom' || provider === 'shell' ? parseArgs(args) : [];
-      let targetGroup = groupId;
-      if (!targetGroup) { const next = await dispatch({ type: 'create_group', title: 'Workspace' }); targetGroup = next.groups[next.groups.length - 1].id; }
-      const next = await dispatch({ type: 'create_session', session: { groupId: targetGroup, title: title.trim() || undefined, provider, cwd: cwd.trim(), model: model.trim(), effort, executable: executable.trim(), args: parsed, initialPrompt: prompt.trim() } });
-      if (next.activeSessionId) created(next.activeSessionId); close();
-    } catch (error) { setError(errorText(error)); } finally { setBusy(false); }
-  }
-  return <Modal title="New session" close={close}><form onSubmit={event => void submit(event)} className="form">
-    <label>Title <span className="optional">optional · follows your first prompt</span><input value={title} onChange={e => setTitle(e.target.value)} placeholder="What are you working on?" maxLength={200} /></label>
-    <div className="form-grid"><label>Agent<select value={provider} onChange={e => setProvider(e.target.value as Provider)}><ProviderOptions /></select></label><label>Group<select value={groupId} onChange={e => setGroup(e.target.value)}>{snapshot.groups.length ? snapshot.groups.map(group => <option key={group.id} value={group.id}>{group.title}</option>) : <option value="">Workspace (new)</option>}</select></label></div>
-    <FolderField value={cwd} change={setCwd} required />
-    {(provider === 'claude' || provider === 'codex') && <div className="form-grid"><label>Model<input value={model} onChange={e => setModel(e.target.value)} placeholder="Provider default" /></label><label>Reasoning effort<select value={effort} onChange={e => setEffort(e.target.value)}><EffortOptions /></select></label></div>}
-    {(provider === 'shell' || provider === 'custom') && <><label>Executable<input required={provider === 'custom'} value={executable} onChange={e => setExecutable(e.target.value)} placeholder={provider === 'shell' ? 'Default system shell' : 'Executable name or full path'} /></label><label>Arguments <span className="optional">JSON array</span><input value={args} onChange={e => setArgs(e.target.value)} placeholder='["--flag", "value"]' spellCheck={false} className="mono" /></label></>}
-    {provider !== 'shell' && <label>Initial prompt <span className="optional">optional</span><textarea value={prompt} onChange={e => setPrompt(e.target.value)} placeholder="Give the agent a place to start…" rows={3} /></label>}
-    {error && <p className="form-error" role="alert">{error}</p>}
-    <footer><button type="button" className="secondary" onClick={close}>Cancel</button><button className="primary" disabled={busy}>{busy ? 'Starting…' : 'Create session'}</button></footer>
-  </form></Modal>;
 }
 
 export function SessionSettings({ session, dispatch, close }: { session: Session; dispatch: Dispatch; close: () => void }) {

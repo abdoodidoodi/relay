@@ -9,8 +9,8 @@ vi.mock('./Terminal', () => ({ default: ({ sessionId }: { sessionId: string }) =
 import App from './App';
 
 function initial(): Snapshot {
-  const base = { titleLocked: false, provider: 'codex' as const, cwd: 'C:\\work', model: '', effort: '', executable: '', args: [], providerSessionId: 'opaque-thread-id', status: 'ready' as const, unread: true, archived: false, createdAt: 1, updatedAt: 1, lastActivityAt: 1, error: null, initialPrompt: '', kind: 'work' as const, groupId: 'g' };
-  return { version: 1, groups: [{ id: 'g', title: 'Projects', collapsed: false }], sessions: [{ ...base, id: 'one', title: 'First task' }, { ...base, id: 'two', title: 'Second task' }], notifications: [{ id: 'n', title: 'Useful update', body: 'Keep me until I am dismissed.', source: 'test', sessionId: 'two', createdAt: 1, dismissed: false, dedupeKey: null }], rules: [], settings: { autoResume: true, closeToTray: true, defaultCwd: 'C:\\work', defaultProvider: 'codex' }, activeSessionId: 'one', dataDir: 'C:\\relay-data', hookEndpoint: 'http://127.0.0.1:9000/events', platform: 'windows' };
+  const base = { titleLocked: false, provider: 'codex' as const, cwd: 'C:\\work', model: '', effort: '', executable: '', args: [], providerSessionId: 'opaque-thread-id', status: 'ready' as const, unread: true, archived: false, createdAt: 1, updatedAt: 1, lastActivityAt: 1, error: null, initialPrompt: '', kind: 'work' as const, groupId: 'g', shellIntegrated: true, shellCwd: 'C:\\work' };
+  return { version: 1, groups: [{ id: 'g', title: 'Projects', collapsed: false }], sessions: [{ ...base, id: 'one', title: 'First task' }, { ...base, id: 'two', title: 'Second task' }], notifications: [{ id: 'n', title: 'Useful update', body: 'Keep me until I am dismissed.', source: 'test', sessionId: 'two', createdAt: 1, dismissed: false, dedupeKey: null }], rules: [], settings: { autoResume: false, closeToTray: true, defaultCwd: 'C:\\work', defaultProvider: 'shell', setupComplete: true, shellExecutable: 'powershell.exe' }, activeSessionId: 'one', dataDir: 'C:\\relay-data', hookEndpoint: 'http://127.0.0.1:9000/events', platform: 'windows' };
 }
 
 describe('Relay workspace actions', () => {
@@ -22,13 +22,78 @@ describe('Relay workspace actions', () => {
     action = vi.fn(async (next: Action) => {
       if (next.type === 'open_notification') state = { ...state, activeSessionId: 'two' };
       if (next.type === 'dismiss_notification') state = { ...state, notifications: state.notifications.map(n => ({ ...n, dismissed: true })) };
-      if (next.type === 'select_session') state = { ...state, activeSessionId: next.id };
+      if (next.type === 'select_session') state = { ...state, activeSessionId: next.id, sessions: state.sessions.map(session => session.id === next.id && session.status === 'stopped' ? { ...session, status: 'idle' } : session) };
       if (next.type === 'update_session') state = { ...state, sessions: state.sessions.map(s => s.id === next.id ? { ...s, ...next } : s) };
+      if (next.type === 'update_group') state = { ...state, groups: state.groups.map(group => group.id === next.id ? { ...group, ...next } : group) };
+      if (next.type === 'new_terminal' || next.type === 'complete_setup') {
+        const sample = initial().sessions[0];
+        const cwd = next.type === 'complete_setup' ? next.cwd : state.settings.defaultCwd;
+        const terminal = { ...sample, id: `terminal-${state.sessions.length + 1}`, title: `Terminal ${state.sessions.length + 1}`, provider: 'shell' as const, status: 'idle' as const, unread: false, groupId: next.type === 'new_terminal' ? next.groupId || state.groups[0].id : state.groups[0].id, cwd, shellCwd: cwd, model: '', effort: '', providerSessionId: null };
+        state = { ...state, activeSessionId: terminal.id, sessions: [...state.sessions, terminal], settings: next.type === 'complete_setup' ? { ...state.settings, setupComplete: true, defaultCwd: next.cwd } : state.settings };
+      }
       return state;
     });
     mock.getTransport.mockResolvedValue({ snapshot: async () => state, action, onState: async (callback: (snapshot: Snapshot) => void) => { notify = callback; return () => {}; }, onOutput: async () => () => {} });
   });
   afterEach(cleanup);
+
+  it('asks only for a folder once, then immediately shows the normal shell', async () => {
+    state = { ...state, sessions: [], activeSessionId: null, notifications: [], groups: [{ id: 'g', title: 'Group 1', collapsed: false }], settings: { ...state.settings, setupComplete: false } };
+    const rendered = render(<StrictMode><App /></StrictMode>);
+    await screen.findByRole('heading', { name: 'Choose your starting folder.' });
+    expect(screen.queryByLabelText('Agent')).toBeNull();
+    expect(screen.queryByLabelText('Model')).toBeNull();
+    fireEvent.change(screen.getByLabelText('Working folder'), { target: { value: 'D:\\project' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Open terminal' }));
+    await waitFor(() => expect(screen.getByTestId('terminal').textContent).toBe('terminal-1'));
+    expect(action).toHaveBeenCalledWith({ type: 'complete_setup', cwd: 'D:\\project' });
+    expect(screen.getByRole('button', { name: 'Rename group Group 1' })).toBeTruthy();
+    expect(state.sessions[0].provider).toBe('shell');
+    expect(screen.queryByRole('dialog')).toBeNull();
+    rendered.unmount(); render(<StrictMode><App /></StrictMode>);
+    await screen.findByTestId('terminal');
+    expect(screen.queryByText('Choose your starting folder.')).toBeNull();
+    expect(action).toHaveBeenCalledTimes(1);
+  });
+
+  it('creates default shell tabs immediately from plus and the new-tab shortcut without a creation dialog', async () => {
+    render(<App />); await screen.findByTestId('terminal');
+    fireEvent.click(screen.getByRole('button', { name: 'New tab in Projects' }));
+    await waitFor(() => expect(screen.getByTestId('terminal').textContent).toBe('terminal-3'));
+    expect(action).toHaveBeenCalledWith({ type: 'new_terminal', groupId: 'g' });
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(screen.queryByLabelText('Agent')).toBeNull();
+    fireEvent.keyDown(window, { key: 'n', ctrlKey: true });
+    await waitFor(() => expect(screen.getByTestId('terminal').textContent).toBe('terminal-4'));
+    expect(action.mock.calls.every(([mutation]) => mutation.type === 'new_terminal')).toBe(true);
+    expect(state.sessions.slice(-2).every(session => session.provider === 'shell' && session.model === '')).toBe(true);
+  });
+
+  it('does not start restored tabs until one is clicked, then selects only that tab', async () => {
+    state.sessions = state.sessions.map(session => ({ ...session, status: 'stopped' }));
+    render(<StrictMode><App /></StrictMode>); await screen.findByTestId('terminal');
+    expect(action).not.toHaveBeenCalled();
+    expect(screen.getByRole('button', { name: 'Restore tab' })).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: /^Stopped Second task/ }));
+    await waitFor(() => expect(state.sessions[1].status).toBe('idle'));
+    expect(state.sessions[0].status).toBe('stopped');
+    expect(action).toHaveBeenCalledExactlyOnceWith({ type: 'select_session', id: 'two' });
+    expect(screen.getByTestId('terminal').textContent).toBe('two');
+  });
+
+  it('renames groups inline without collapsing them and keeps the chevron independent', async () => {
+    render(<App />); await screen.findByTestId('terminal');
+    fireEvent.click(screen.getByRole('button', { name: 'Rename group Projects' }));
+    expect(screen.queryByRole('dialog')).toBeNull();
+    fireEvent.change(screen.getByLabelText('Group name'), { target: { value: '  My project  ' } });
+    fireEvent.keyDown(screen.getByLabelText('Group name'), { key: 'Enter' });
+    await screen.findByRole('button', { name: 'Rename group My project' });
+    expect(action).toHaveBeenCalledExactlyOnceWith({ type: 'update_group', id: 'g', title: 'My project' });
+    expect(state.groups[0].collapsed).toBe(false);
+    fireEvent.click(screen.getByRole('button', { name: 'Collapse My project' }));
+    await screen.findByRole('button', { name: 'Expand My project' });
+    expect(action).toHaveBeenLastCalledWith({ type: 'update_group', id: 'g', collapsed: true });
+  });
 
   it('restores the persisted active session under React StrictMode', async () => {
     render(<StrictMode><App /></StrictMode>);
@@ -115,11 +180,9 @@ describe('Relay workspace actions', () => {
   it('uses native Command shortcut labels on macOS', async () => {
     state.platform = 'macos';
     render(<App />); await screen.findByTestId('terminal');
-    expect(screen.getByRole('button', { name: 'New session Cmd N' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'New tab Cmd N' })).toBeTruthy();
     expect(screen.getByRole('button', { name: 'Search sessions' }).getAttribute('title')).toBe('Search sessions · Cmd+K');
     expect(screen.getByText(/Cmd F/)).toBeTruthy();
-    fireEvent.click(screen.getByRole('button', { name: 'Relay' }));
-    expect(screen.getByText('Cmd K')).toBeTruthy();
     expect(screen.queryByText(/Ctrl/)).toBeNull();
   });
 

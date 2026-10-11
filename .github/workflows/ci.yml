@@ -29,14 +29,8 @@ jobs:
       - run: npm ci
       - run: npm run check
       - run: npm test
+      - run: npm run test:startup
       - run: npm run test:connectors
       - run: npm run build
       - run: npm run test:native
-      - run: npm run desktop:build
-      - uses: actions/upload-artifact@v4
-        with:
-          name: relay-${{ runner.os }}-${{ runner.arch }}
-          path: |
-            src-tauri/target/release/bundle/nsis/*.exe
-            src-tauri/target/release/bundle/dmg/*.dmg
-          if-no-files-found: error
+      - run: npm run desktop:build -- --no-bundle

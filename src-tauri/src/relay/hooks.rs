@@ -147,7 +147,9 @@ fn handle_request(mut request: tiny_http::Request, weak: &Weak<Runtime>, port: u
     );
     let result = if !authorized {
         Err((403, "Unauthorized local event".into()))
-    } else if request.method() != &tiny_http::Method::Post || request.url() != "/events" {
+    } else if request.method() != &tiny_http::Method::Post
+        || !matches!(request.url(), "/events" | "/prepare")
+    {
         Err((404, "Use POST /events".into()))
     } else if request.body_length().is_none() || request.body_length().unwrap_or(0) > MAX_BODY {
         Err((
@@ -161,16 +163,29 @@ fn handle_request(mut request: tiny_http::Request, weak: &Weak<Runtime>, port: u
             .take((MAX_BODY + 1) as u64)
             .read_to_end(&mut body)
         {
-            Ok(_) if body.len() <= MAX_BODY => match serde_json::from_slice::<HookEvent>(&body) {
-                Ok(event) => runtime.apply_event(event).map(|_| ()).map_err(|e| (400, e)),
-                Err(e) => Err((400, e.to_string())),
-            },
+            Ok(_) if body.len() <= MAX_BODY => {
+                if request.url() == "/prepare" {
+                    serde_json::from_slice::<super::shell::PrepareRequest>(&body)
+                        .map_err(|e| (400, e.to_string()))
+                        .and_then(|r| runtime.prepare_provider(r).map_err(|e| (400, e)))
+                        .and_then(|r| serde_json::to_value(r).map_err(|e| (500, e.to_string())))
+                } else {
+                    serde_json::from_slice::<HookEvent>(&body)
+                        .map_err(|e| (400, e.to_string()))
+                        .and_then(|event| {
+                            runtime
+                                .apply_event(event)
+                                .map(|_| serde_json::json!({"ok":true}))
+                                .map_err(|e| (400, e))
+                        })
+                }
+            }
             Ok(_) => Err((413, "Event body exceeds limit".into())),
             Err(e) => Err((400, e.to_string())),
         }
     };
     let (status, body) = match result {
-        Ok(()) => (200, serde_json::json!({"ok":true}).to_string()),
+        Ok(value) => (200, value.to_string()),
         Err((status, error)) => (status, serde_json::json!({"error":error}).to_string()),
     };
     let _ = request.respond(
@@ -215,9 +230,28 @@ pub fn map_payload(event: &str, payload: &Value, session_id: Option<String>) -> 
         effort,
         title,
         body,
-        prompt: get("prompt").or_else(|| get("user_prompt")),
+        prompt: get("prompt").or_else(|| get("user_prompt")).or_else(|| {
+            payload
+                .get("input-messages")
+                .and_then(Value::as_array)
+                .and_then(|a| {
+                    a.iter().find_map(|v| {
+                        v.as_str()
+                            .filter(|s| !s.trim().is_empty())
+                            .map(str::to_owned)
+                    })
+                })
+        }),
         source: Some(if is_codex { "codex" } else { "claude" }.into()),
         transcript_path: get("transcript_path"),
+        provider: Some(if is_codex { "codex" } else { "claude" }.into()),
+        provider_turn_id: get("turn-id"),
+        cwd: get("cwd").or_else(|| {
+            payload
+                .pointer("/workspace/current_dir")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        }),
         ..Default::default()
     };
     if event == "ready" {
@@ -249,6 +283,22 @@ pub fn local_endpoint(endpoint: &str) -> bool {
 }
 pub fn run_cli_mode() -> bool {
     let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("--relay-prepare") {
+        super::shell::run_prepare_cli(&args);
+        return true;
+    }
+    if args.get(1).map(String::as_str) == Some("--relay-shell") {
+        let event = HookEvent {
+            event: "shell_cwd".into(),
+            session_id: std::env::var("RELAY_SESSION_ID").ok(),
+            cwd: args.get(2).cloned(),
+            ..Default::default()
+        };
+        if let Err(error) = post_local("events", &event) {
+            eprintln!("Relay shell update failed: {error}");
+        }
+        return true;
+    }
     if args.get(1).map(String::as_str) != Some("--relay-hook") {
         return false;
     }
@@ -317,6 +367,40 @@ pub fn run_cli_mode() -> bool {
         eprintln!("Relay hook delivery failed: {error}");
     }
     true
+}
+
+pub fn post_local(route: &str, body: &impl serde::Serialize) -> Result<Value, String> {
+    let endpoint = std::env::var("RELAY_ENDPOINT").unwrap_or_default();
+    let token = std::env::var("RELAY_TOKEN").unwrap_or_default();
+    if !local_endpoint(&endpoint) || token.is_empty() {
+        return Err("No authenticated Relay shell connection".into());
+    }
+    let url = if route == "prepare" {
+        endpoint.trim_end_matches("/events").to_owned() + "/prepare"
+    } else {
+        endpoint
+    };
+    let response = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|e| e.to_string())?
+        .post(url)
+        .bearer_auth(token)
+        .json(body)
+        .send()
+        .map_err(|e| e.to_string())?;
+    let success = response.status().is_success();
+    let value: Value = response.json().map_err(|e| e.to_string())?;
+    if !success {
+        return Err(value
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("Preparation rejected")
+            .into());
+    }
+    Ok(value)
 }
 
 pub fn hook_command(binary: &Path, event: &str) -> String {

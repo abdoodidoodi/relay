@@ -123,7 +123,7 @@ pub fn resolve_program(program: &str) -> Result<PathBuf, String> {
         "{program} is not installed or is not on PATH. Install the CLI, then start this tab again."
     ))
 }
-fn resolve_command(program: &str, args: Vec<String>) -> Result<(PathBuf, Vec<String>), String> {
+pub fn resolve_command(program: &str, args: Vec<String>) -> Result<(PathBuf, Vec<String>), String> {
     let path = resolve_program(program)?;
     #[cfg(windows)]
     if path
@@ -217,7 +217,9 @@ pub fn provider_args(
                         .ok_or("Codex conversation has not been bound yet")?,
                 ]);
             }
-            args.push("--no-alt-screen".into());
+            if !session.shell_integrated {
+                args.push("--no-alt-screen".into());
+            }
             if !session.model.is_empty() {
                 args.extend(["--model".into(), session.model.clone()]);
             }
@@ -273,14 +275,18 @@ pub fn spawn(
         &hook_path.with_extension("connection.json"),
         &serde_json::to_vec(&connection).map_err(|e| e.to_string())?,
     )?;
-    if session.provider == "claude" {
+    if session.provider == "claude" && !session.shell_integrated {
         hooks::private_write(
             &hook_path,
             &serde_json::to_vec(&hooks::claude_settings(&hook_binary))
                 .map_err(|e| e.to_string())?,
         )?;
     }
-    let mut args = provider_args(session, resume, &hook_binary, &hook_path)?;
+    let mut args = if session.shell_integrated {
+        vec![]
+    } else {
+        provider_args(session, resume, &hook_binary, &hook_path)?
+    };
     if initial_prompt
         && !session.initial_prompt.is_empty()
         && matches!(session.provider.as_str(), "claude" | "codex")
@@ -317,7 +323,12 @@ pub fn spawn(
     } else {
         session.executable.clone()
     };
-    let (program, args) = resolve_command(&executable, args)?;
+    let (program, args, zdotdir) = if session.shell_integrated {
+        super::shell::bootstrap(runtime, session, resume, &hook_path)?
+    } else {
+        let (program, args) = resolve_command(&executable, args)?;
+        (program, args, None)
+    };
     let pty = native_pty_system()
         .openpty(PtySize {
             rows: 30,
@@ -328,7 +339,16 @@ pub fn spawn(
         .map_err(|e| format!("Cannot open PTY: {e}"))?;
     let mut command = CommandBuilder::new(&program);
     command.args(&args);
-    command.cwd(&session.cwd);
+    command.cwd(
+        if session.shell_integrated && !session.shell_cwd.is_empty() {
+            &session.shell_cwd
+        } else {
+            &session.cwd
+        },
+    );
+    if let Some(zdotdir) = zdotdir {
+        command.env("ZDOTDIR", zdotdir);
+    }
     if let Ok(path) = std::env::join_paths(search_directories()) {
         command.env("PATH", path);
     }
@@ -464,6 +484,8 @@ mod tests {
             error: None,
             initial_prompt: String::new(),
             kind: "work".into(),
+            shell_integrated: false,
+            shell_cwd: String::new(),
         }
     }
     #[test]

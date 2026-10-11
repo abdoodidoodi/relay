@@ -9,6 +9,8 @@
     "node": ">=20.19.0"
   },
   "scripts": {
+    "start": "node scripts/start.mjs",
+    "doctor": "node scripts/start.mjs --doctor",
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "check": "tsc --noEmit",
@@ -17,6 +19,7 @@
     "desktop:build": "node scripts/relay-tool.mjs build",
     "tauri": "node scripts/relay-tool.mjs",
     "test": "vitest run",
+    "test:startup": "node --test scripts/start.test.mjs",
     "test:connectors": "node --test integrations",
     "test:native": "node scripts/relay-tool.mjs native-test"
   },

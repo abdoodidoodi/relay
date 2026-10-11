@@ -7,7 +7,7 @@ export interface Session {
   executable: string; args: string[]; providerSessionId: string | null;
   status: SessionStatus; unread: boolean; archived: boolean;
   createdAt: number; updatedAt: number; lastActivityAt: number;
-  error: string | null; initialPrompt: string; kind: 'work' | 'assistant';
+  error: string | null; initialPrompt: string; kind: 'work' | 'assistant'; shellIntegrated: boolean; shellCwd: string;
 }
 export interface Notification {
   id: string; title: string; body: string; source: string;
@@ -19,7 +19,7 @@ export interface Rule {
   command: string; args: string[]; cwd: string; body: string;
   sessionId: string | null; lastRunAt: number | null; lastError: string | null;
 }
-export interface Settings { autoResume: boolean; closeToTray: boolean; defaultCwd: string; defaultProvider: Provider; }
+export interface Settings { autoResume: boolean; closeToTray: boolean; defaultCwd: string; defaultProvider: Provider; setupComplete: boolean; shellExecutable: string; }
 export interface Snapshot {
   version: number; groups: Group[]; sessions: Session[]; notifications: Notification[];
   rules: Rule[]; settings: Settings; activeSessionId: string | null;
@@ -31,6 +31,8 @@ export interface CreateSession {
   kind?: 'work' | 'assistant'; providerSessionId?: string;
 }
 export type Action =
+  | { type: 'complete_setup'; cwd: string }
+  | { type: 'new_terminal'; groupId?: string }
   | { type: 'create_group'; title: string }
   | { type: 'update_group'; id: string; title?: string; collapsed?: boolean }
   | { type: 'delete_group'; id: string }

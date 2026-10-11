@@ -2,6 +2,7 @@ pub mod hooks;
 mod ledger;
 mod pty;
 mod rules;
+mod shell;
 mod types;
 
 use ledger::{session_mut, Ledger};
@@ -351,6 +352,45 @@ impl Runtime {
         self.emit_state();
     }
     pub fn apply_event(&self, mut event: HookEvent) -> Result<(), String> {
+        if event.event == "shell_cwd" {
+            let sid = event
+                .session_id
+                .as_deref()
+                .ok_or("Shell event requires a tab ID")?;
+            let cwd = event
+                .cwd
+                .as_deref()
+                .ok_or("Shell event requires a folder")?;
+            if cwd.len() > 16000 || !Path::new(cwd).is_dir() {
+                return Err("Invalid shell folder".into());
+            }
+            let mut ledger = self.ledger.lock().map_err(|_| "Ledger lock poisoned")?;
+            let s = ledger
+                .data
+                .sessions
+                .iter()
+                .find(|s| s.id == sid)
+                .ok_or("Session does not exist")?;
+            if !s.shell_integrated || s.archived {
+                return Err("Not an integrated terminal".into());
+            }
+            if s.shell_cwd == cwd && s.status == "idle" {
+                return Ok(());
+            }
+            ledger.change(|d| {
+                let s = session_mut(d, sid)?;
+                s.shell_cwd = cwd.into();
+                if s.provider == "shell" {
+                    s.cwd = cwd.into();
+                }
+                s.status = "idle".into();
+                s.updated_at = now();
+                Ok(())
+            })?;
+            drop(ledger);
+            self.emit_state();
+            return Ok(());
+        }
         if !matches!(
             event.event.as_str(),
             "session_start" | "prompt" | "working" | "ready" | "notification" | "settings"
@@ -365,6 +405,7 @@ impl Runtime {
             &event.source,
             &event.dedupe_key,
             &event.session_id,
+            &event.provider,
         ] {
             if value
                 .as_ref()
@@ -378,16 +419,59 @@ impl Runtime {
         if event.event == "ready" {
             if let Some(sid) = event.session_id.as_deref() {
                 if let Ok(mut s) = self.session(sid) {
-                    if s.provider == "codex" {
+                    if s.provider == "codex" || event.provider.as_deref() == Some("codex") {
+                        s.provider = "codex".into();
+                        let provider_home = self
+                            .ledger
+                            .lock()
+                            .ok()
+                            .and_then(|l| l.data.provider_homes.get(sid).cloned());
                         if let Some(pid) = &event.provider_session_id {
                             s.provider_session_id = Some(pid.clone());
+                            let known = event.transcript_path.clone().or_else(|| {
+                                self.ledger
+                                    .lock()
+                                    .ok()
+                                    .and_then(|l| l.data.transcripts.get(sid).cloned())
+                            });
+                            let path = exact_transcript(&s, known.as_deref()).or_else(|| {
+                                provider_home.as_ref().and_then(|home| {
+                                    find_transcript(&Path::new(home).join("sessions"), pid, 5)
+                                })
+                            });
+                            let attested = path.filter(|path| {
+                                for attempt in 0..3 {
+                                    if codex_completion_attested(
+                                        path,
+                                        pid,
+                                        event.provider_turn_id.as_deref(),
+                                    ) {
+                                        return true;
+                                    }
+                                    if attempt < 2 {
+                                        std::thread::sleep(std::time::Duration::from_millis(50));
+                                    }
+                                }
+                                false
+                            });
+                            if attested.is_none() {
+                                // Codex's temporary title threads also inherit notify. They
+                                // have no durable root rollout; never bind or mark ready on
+                                // their completion, regardless of prompt or answer content.
+                                return Ok(());
+                            }
+                            event.transcript_path =
+                                attested.map(|p| p.to_string_lossy().into_owned());
                         }
-                        if let Some(path) = exact_transcript(&s, None) {
+                        if let Some(path) = exact_transcript(&s, event.transcript_path.as_deref()) {
                             if let Some(settings) = transcript_settings(&path, &s) {
                                 event.model = settings.model;
                                 event.effort = settings.effort;
                                 event.transcript_path = Some(path.to_string_lossy().into_owned());
                             }
+                        }
+                        if let Some(title) = codex_title(&s, provider_home.as_deref()) {
+                            event.title = Some(title);
                         }
                     }
                 }
@@ -398,8 +482,21 @@ impl Runtime {
         {
             return Err("Event text exceeds limit".into());
         }
+        if event
+            .cwd
+            .as_ref()
+            .is_some_and(|s| s.len() > 16000 || s.contains('\0'))
+        {
+            return Err("Invalid provider working folder".into());
+        }
         let mut ledger = self.ledger.lock().map_err(|_| "Ledger lock poisoned")?;
         let sid = event.session_id.as_deref();
+        if let Some(expected) = &event.expected_provider_session_id {
+            let current = sid.and_then(|id| ledger.data.sessions.iter().find(|s| s.id == id));
+            if current.is_none_or(|s| s.provider_session_id.as_ref() != Some(expected)) {
+                return Ok(());
+            }
+        }
         if event.event == "settings" {
             let id = sid.ok_or("Settings event requires a Relay session ID")?;
             let s = ledger
@@ -423,7 +520,9 @@ impl Runtime {
                 && event
                     .provider_session_id
                     .as_ref()
-                    .is_none_or(|p| Some(p) == s.provider_session_id.as_ref());
+                    .is_none_or(|p| Some(p) == s.provider_session_id.as_ref())
+                && event.cwd.as_ref().is_none_or(|p| p == &s.cwd)
+                && event.provider.as_ref().is_none_or(|p| p == &s.provider);
             let same_transcript = event
                 .transcript_path
                 .as_ref()
@@ -439,13 +538,19 @@ impl Runtime {
         let applied = ledger
             .change_event(dedupe.as_deref(), |data| {
                 if let Some(id) = sid {
-                    let provider = data
-                        .sessions
-                        .iter()
-                        .find(|s| s.id == id)
-                        .ok_or("Session does not exist")?
-                        .provider
-                        .clone();
+                    let provider = event.provider.clone().unwrap_or_else(|| {
+                        data.sessions
+                            .iter()
+                            .find(|s| s.id == id)
+                            .map(|s| s.provider.clone())
+                            .unwrap_or_default()
+                    });
+                    if !valid_provider(&provider) {
+                        return Err("Unknown event provider".into());
+                    }
+                    if !data.sessions.iter().any(|s| s.id == id) {
+                        return Err("Session does not exist".into());
+                    }
                     if let Some(provider_id) = &event.provider_session_id {
                         ledger::ensure_provider_id(data, id, &provider, provider_id)?;
                     }
@@ -458,6 +563,10 @@ impl Runtime {
                         data.conversation_started.insert(id.into());
                     }
                     let s = session_mut(data, id)?;
+                    s.provider = provider;
+                    if let Some(cwd) = event.cwd.as_ref().filter(|p| Path::new(p).is_dir()) {
+                        s.cwd = cwd.clone();
+                    }
                     if let Some(provider_id) = &event.provider_session_id {
                         s.provider_session_id = Some(provider_id.clone());
                     }
@@ -474,7 +583,12 @@ impl Runtime {
                     if !s.title_locked {
                         if let Some(title) = event.title.as_ref().filter(|t| !t.trim().is_empty()) {
                             s.title = title.chars().take(120).collect();
-                        } else if event.event == "prompt" {
+                        } else if matches!(event.event.as_str(), "prompt" | "ready")
+                            && (s.title == "Terminal"
+                                || s.title == "claude"
+                                || s.title == "codex"
+                                || s.title.ends_with(" session"))
+                        {
                             if let Some(prompt) = &event.prompt {
                                 s.title = prompt
                                     .split_whitespace()
@@ -598,6 +712,31 @@ impl Runtime {
             .map_err(|_| "Ledger lock poisoned")?
             .change(|data| {
                 match action {
+                    Action::CompleteSetup { cwd } => {
+                        if data.settings.setup_complete {
+                            return Err("Working folder setup is already complete".into());
+                        }
+                        if !Path::new(&cwd).is_dir() {
+                            return Err("Choose an existing working folder".into());
+                        }
+                        data.settings.default_cwd = cwd;
+                        data.settings.setup_complete = true;
+                        data.settings.auto_resume = false;
+                        let group = data
+                            .groups
+                            .first()
+                            .ok_or("Group does not exist")?
+                            .id
+                            .clone();
+                        start = Some(shell::new_terminal(data, &group)?);
+                    }
+                    Action::NewTerminal { group_id } => {
+                        if !data.settings.setup_complete {
+                            return Err("Choose your working folder first".into());
+                        }
+                        let group = group_id.unwrap_or_else(|| data.groups[0].id.clone());
+                        start = Some(shell::new_terminal(data, &group)?);
+                    }
                     Action::CreateGroup { title } => {
                         let title = short_title(&title)?;
                         data.groups.push(Group {
@@ -693,6 +832,8 @@ impl Runtime {
                             error: None,
                             initial_prompt: c.initial_prompt.unwrap_or_default(),
                             kind: kind.clone(),
+                            shell_integrated: false,
+                            shell_cwd: String::new(),
                         });
                         data.active_session_id = Some(sid.clone());
                         if kind == "work" {
@@ -782,7 +923,11 @@ impl Runtime {
                     }
                     Action::SelectSession { id } => {
                         let s = session_mut(data, &id)?;
+                        if s.archived {
+                            return Err("Archived sessions cannot be selected".into());
+                        }
                         s.unread = false;
+                        start = Some(id.clone());
                         data.active_session_id = Some(id);
                     }
                     Action::DismissNotification { id } => {
@@ -802,7 +947,10 @@ impl Runtime {
                             .clone();
                         let s = session_mut(data, &sid)?;
                         s.unread = false;
-                        s.archived = false;
+                        if s.archived {
+                            return Err("This notification belongs to an archived tab".into());
+                        }
+                        start = Some(sid.clone());
                         data.active_session_id = Some(sid);
                     }
                     Action::SaveRule { mut rule } => {
@@ -859,30 +1007,17 @@ impl Runtime {
         self.snapshot()
     }
     fn restore(self: &Arc<Self>) -> Result<(), String> {
-        let wanted = {
-            let mut l = self.ledger.lock().map_err(|_| "Ledger lock poisoned")?;
-            let wanted = if l.data.settings.auto_resume {
-                l.data.resume_on_launch.iter().cloned().collect::<Vec<_>>()
-            } else {
-                vec![]
-            };
-            l.change(|d| {
+        self.ledger
+            .lock()
+            .map_err(|_| "Ledger lock poisoned")?
+            .change(|d| {
                 for s in &mut d.sessions {
-                    if matches!(s.status.as_str(), "starting" | "running" | "ready" | "idle") {
-                        s.status = "stopped".into();
-                    }
+                    s.status = "stopped".into();
                 }
+                d.resume_on_launch.clear();
+                d.settings.auto_resume = false;
                 Ok(())
             })?;
-            wanted
-        };
-        for id in wanted {
-            if self.session(&id).is_ok_and(|s| !s.archived) {
-                if let Err(error) = self.start_session(&id, true) {
-                    eprintln!("Relay restore failed: {error}");
-                }
-            }
-        }
         self.emit_state();
         Ok(())
     }
@@ -915,6 +1050,7 @@ fn start_metadata_watch(runtime: &Arc<Runtime>) {
     std::thread::spawn(move || {
         let mut observed: HashMap<String, std::time::SystemTime> = HashMap::new();
         let mut attempted: HashMap<String, std::time::Instant> = HashMap::new();
+        let mut title_index_observed: HashMap<PathBuf, std::time::SystemTime> = HashMap::new();
         while let Some(runtime) = weak.upgrade() {
             if runtime.quitting.load(Ordering::Relaxed) {
                 break;
@@ -929,6 +1065,25 @@ fn start_metadata_watch(runtime: &Arc<Runtime>) {
                 for session in data.sessions.iter().filter(|s| {
                     s.provider == "codex" && s.provider_session_id.is_some() && live.contains(&s.id)
                 }) {
+                    let home = data.provider_homes.get(&session.id).map(String::as_str);
+                    if let Some(index) = codex_index_path(home) {
+                        if let Ok(modified) = std::fs::metadata(&index).and_then(|m| m.modified()) {
+                            // Check each bound title; an index can serve multiple tabs.
+                            if title_index_observed.get(&index) != Some(&modified) {
+                                if let Some(title) = codex_title(session, home) {
+                                    let _ = runtime.apply_event(HookEvent {
+                                        event: "settings".into(),
+                                        session_id: Some(session.id.clone()),
+                                        expected_provider_session_id: session
+                                            .provider_session_id
+                                            .clone(),
+                                        title: Some(title),
+                                        ..Default::default()
+                                    });
+                                }
+                            }
+                        }
+                    }
                     let known = data.transcripts.get(&session.id).map(String::as_str);
                     if known.is_none()
                         && attempted
@@ -952,6 +1107,15 @@ fn start_metadata_watch(runtime: &Arc<Runtime>) {
                         event.transcript_path = Some(path.to_string_lossy().into_owned());
                         if let Err(error) = runtime.apply_event(event) {
                             eprintln!("Relay settings capture failed: {error}");
+                        }
+                    }
+                }
+                for home in std::iter::once(None)
+                    .chain(data.provider_homes.values().map(|s| Some(s.as_str())))
+                {
+                    if let Some(path) = codex_index_path(home) {
+                        if let Ok(modified) = std::fs::metadata(&path).and_then(|m| m.modified()) {
+                            title_index_observed.insert(path, modified);
                         }
                     }
                 }
@@ -990,27 +1154,27 @@ fn exact_transcript(session: &Session, known: Option<&str>) -> Option<PathBuf> {
             .unwrap_or_else(|| home.join(".codex"))
             .join("sessions")
     };
-    fn find(root: &Path, sid: &str, depth: u8) -> Option<PathBuf> {
-        if depth == 0 {
-            return None;
-        }
-        for entry in std::fs::read_dir(root).ok()?.flatten() {
-            let path = entry.path();
-            if path.is_file()
-                && path.extension().is_some_and(|e| e == "jsonl")
-                && transcript_name_matches(&path, sid)
-            {
-                return Some(path);
-            }
-            if path.is_dir() {
-                if let Some(found) = find(&path, sid, depth - 1) {
-                    return Some(found);
-                }
-            }
-        }
-        None
+    find_transcript(&root, sid, 5)
+}
+fn find_transcript(root: &Path, sid: &str, depth: u8) -> Option<PathBuf> {
+    if depth == 0 {
+        return None;
     }
-    find(&root, sid, 5)
+    for entry in std::fs::read_dir(root).ok()?.flatten() {
+        let path = entry.path();
+        if path.is_file()
+            && path.extension().is_some_and(|e| e == "jsonl")
+            && transcript_name_matches(&path, sid)
+        {
+            return Some(path);
+        }
+        if path.is_dir() {
+            if let Some(found) = find_transcript(&path, sid, depth - 1) {
+                return Some(found);
+            }
+        }
+    }
+    None
 }
 fn transcript_name_matches(path: &Path, sid: &str) -> bool {
     path.file_name()
@@ -1019,6 +1183,98 @@ fn transcript_name_matches(path: &Path, sid: &str) -> bool {
             name == format!("{sid}.jsonl") || name.ends_with(&format!("-{sid}.jsonl"))
         })
         .unwrap_or(false)
+}
+fn codex_completion_attested(path: &Path, sid: &str, turn: Option<&str>) -> bool {
+    use std::io::{BufRead, Read, Seek, SeekFrom};
+    let Some(turn) = turn else {
+        return false;
+    };
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut header = String::new();
+    if std::io::BufReader::new((&mut file).take(4 * 1024 * 1024))
+        .read_line(&mut header)
+        .is_err()
+    {
+        return false;
+    }
+    let Ok(meta) = serde_json::from_str::<serde_json::Value>(&header) else {
+        return false;
+    };
+    if meta.get("type").and_then(|v| v.as_str()) != Some("session_meta")
+        || meta
+            .pointer("/payload/id")
+            .or_else(|| meta.pointer("/payload/session_id"))
+            .and_then(|v| v.as_str())
+            != Some(sid)
+        || meta
+            .pointer("/payload/source")
+            .and_then(|v| v.as_str())
+            .is_none_or(|v| !matches!(v, "cli" | "exec"))
+        || meta
+            .pointer("/payload/thread_source")
+            .is_some_and(|v| v.as_str() != Some("user"))
+    {
+        return false;
+    }
+    let Ok(size) = file.metadata().map(|m| m.len()) else {
+        return false;
+    };
+    if file
+        .seek(SeekFrom::Start(size.saturating_sub(512 * 1024)))
+        .is_err()
+    {
+        return false;
+    }
+    let mut tail = Vec::new();
+    if file.take(512 * 1024).read_to_end(&mut tail).is_err() {
+        return false;
+    }
+    String::from_utf8_lossy(&tail)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .any(|v| {
+            if v.get("type").and_then(|v| v.as_str()) != Some("event_msg") {
+                return false;
+            }
+            let Some(payload) = v.get("payload") else {
+                return false;
+            };
+            let same_turn = payload
+                .get("turn_id")
+                .or_else(|| payload.get("root_turn_id"))
+                .and_then(|v| v.as_str())
+                == Some(turn);
+            same_turn
+                && (payload.get("type").and_then(|v| v.as_str()) == Some("task_complete")
+                    || (payload.get("thread_id").and_then(|v| v.as_str()) == Some(sid)
+                        && payload.get("type").and_then(|v| v.as_str()) == Some("item_completed")))
+        })
+}
+fn codex_index_path(home: Option<&str>) -> Option<PathBuf> {
+    let home = home
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("CODEX_HOME").map(PathBuf::from))
+        .or_else(|| directories::BaseDirs::new().map(|d| d.home_dir().join(".codex")))?;
+    Some(home.join("session_index.jsonl"))
+}
+fn codex_title(session: &Session, home: Option<&str>) -> Option<String> {
+    use std::io::{BufRead, Read};
+    let sid = session.provider_session_id.as_deref()?;
+    let file = std::fs::File::open(codex_index_path(home)?).ok()?;
+    std::io::BufReader::new(file.take(32 * 1024 * 1024))
+        .lines()
+        .map_while(Result::ok)
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(&line).ok())
+        .filter(|v| v.get("id").and_then(|v| v.as_str()) == Some(sid))
+        .filter_map(|v| {
+            v.get("thread_name")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .map(str::to_owned)
+        })
+        .last()
 }
 fn transcript_settings(path: &Path, session: &Session) -> Option<HookEvent> {
     use std::io::{Read, Seek, SeekFrom};
@@ -1060,6 +1316,7 @@ fn transcript_settings(path: &Path, session: &Session) -> Option<HookEvent> {
     Some(HookEvent {
         event: "settings".into(),
         session_id: Some(session.id.clone()),
+        expected_provider_session_id: session.provider_session_id.clone(),
         model,
         effort,
         ..Default::default()
@@ -1187,6 +1444,11 @@ fn reveal(app: &tauri::AppHandle) {
     }
 }
 pub fn run() {
+    let mut context = tauri::generate_context!();
+    if let Some(data_dir) = std::env::var_os("RELAY_DATA_DIR") {
+        context.config_mut().identifier =
+            isolated_identifier(&context.config().identifier, Path::new(&data_dir));
+    }
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_single_instance::init(|app, _, _| reveal(app)))
@@ -1197,6 +1459,7 @@ pub fn run() {
             let runtime = Runtime::new(data_dir, Some(app.handle().clone()))
                 .map_err(std::io::Error::other)?;
             hooks::start(&runtime).map_err(std::io::Error::other)?;
+            runtime.restore().map_err(std::io::Error::other)?;
             app.manage(runtime.clone());
             use tauri::{
                 menu::{Menu, MenuItem},
@@ -1239,9 +1502,6 @@ pub fn run() {
             tray.build(app)?;
             let restore = runtime.clone();
             std::thread::spawn(move || {
-                if let Err(error) = restore.restore() {
-                    eprintln!("Relay recovery failed: {error}");
-                }
                 rules::start(&restore);
                 start_metadata_watch(&restore);
             });
@@ -1278,13 +1538,217 @@ pub fn run() {
                 }
             }
         })
-        .run(tauri::generate_context!())
+        .run(context)
         .expect("Relay could not start");
+}
+
+fn isolated_identifier(base: &str, directory: &Path) -> String {
+    let absolute = if directory.is_absolute() {
+        directory.to_path_buf()
+    } else {
+        std::env::current_dir().unwrap_or_default().join(directory)
+    };
+    let mut normalized = PathBuf::new();
+    for part in absolute.components() {
+        match part {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            part => normalized.push(part.as_os_str()),
+        }
+    }
+    let key = normalized.to_string_lossy().into_owned();
+    #[cfg(windows)]
+    let key = key.to_lowercase();
+    let hash = key
+        .as_bytes()
+        .iter()
+        .fold(0xcbf29ce484222325u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+        });
+    format!("{base}.data{hash:016x}")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn codex_rollout(dir: &Path, id: &str, turns: &[&str], feature: bool) -> PathBuf {
+        let path = dir.join(format!("{id}.jsonl"));
+        let mut text = serde_json::json!({"type":"session_meta","payload":{"id":id,"source":"cli","thread_source":if feature {serde_json::json!({"feature":"thread_title"})} else {serde_json::json!("user")}}}).to_string();
+        for turn in turns {
+            text.push('\n');
+            text.push_str(&serde_json::json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":turn}}).to_string());
+        }
+        text.push('\n');
+        std::fs::write(&path, text).unwrap();
+        path
+    }
+    #[test]
+    fn codex_hidden_title_completion_never_rebinds_but_genuine_new_root_does() {
+        let temp = tempfile::tempdir().unwrap();
+        let r = Runtime::new(temp.path().into(), None).unwrap();
+        let sid = r
+            .ledger
+            .lock()
+            .unwrap()
+            .change(|d| {
+                d.settings.default_cwd = temp.path().to_string_lossy().into();
+                shell::new_terminal(d, "work")
+            })
+            .unwrap();
+        let aux = codex_rollout(temp.path(), "hidden-title", &["aux-turn"], true);
+        let auxiliary = hooks::map_payload(
+            "ready",
+            &serde_json::json!({"thread-id":"hidden-title","turn-id":"aux-turn","transcript_path":aux,"input-messages":["Generate a concise, single-line task title"],"last-assistant-message":"{\"title\":\"Internal title\"}"}),
+            Some(sid.clone()),
+        );
+        r.apply_event(auxiliary.clone()).unwrap();
+        assert!(r.session(&sid).unwrap().provider_session_id.is_none());
+        assert!(r.snapshot().unwrap().notifications.is_empty());
+        let root = codex_rollout(temp.path(), "root-thread", &["user-turn"], false);
+        assert!(!codex_completion_attested(
+            &root,
+            "root-thread",
+            Some("other-turn")
+        ));
+        // A genuine user can request title-shaped JSON; content must not be the filter.
+        r.apply_event(hooks::map_payload("ready",&serde_json::json!({"thread-id":"root-thread","turn-id":"user-turn","transcript_path":root,"input-messages":["Generate a concise, single-line task title for my work"],"last-assistant-message":"{\"title\":\"Real answer\"}"}),Some(sid.clone()))).unwrap();
+        let before = r.snapshot().unwrap();
+        assert_eq!(
+            before.sessions[0].provider_session_id.as_deref(),
+            Some("root-thread")
+        );
+        assert_eq!(before.notifications.len(), 1);
+        r.apply_event(auxiliary).unwrap();
+        let after = r.snapshot().unwrap();
+        assert_eq!(after.version, before.version);
+        assert_eq!(after.sessions[0].title, before.sessions[0].title);
+        assert_eq!(after.sessions[0].status, "ready");
+        let new_root = codex_rollout(temp.path(), "new-root-thread", &["new-user-turn"], false);
+        r.apply_event(hooks::map_payload("ready",&serde_json::json!({"thread-id":"new-root-thread","turn-id":"new-user-turn","transcript_path":new_root,"last-assistant-message":"New conversation answer"}),Some(sid.clone()))).unwrap();
+        assert_eq!(
+            r.session(&sid).unwrap().provider_session_id.as_deref(),
+            Some("new-root-thread")
+        );
+        assert_eq!(r.snapshot().unwrap().notifications.len(), 2);
+    }
+    #[test]
+    fn restart_is_dormant_and_selection_attempts_only_the_chosen_tab() {
+        let temp = tempfile::tempdir().unwrap();
+        let r = Runtime::new(temp.path().into(), None).unwrap();
+        r.ledger
+            .lock()
+            .unwrap()
+            .change(|d| {
+                d.settings.setup_complete = true;
+                d.settings.default_cwd = temp.path().to_string_lossy().into();
+                for _ in 0..2 {
+                    let sid = shell::new_terminal(d, "work")?;
+                    d.resume_on_launch.insert(sid);
+                }
+                for s in &mut d.sessions {
+                    s.status = "running".into();
+                    s.executable = "relay-test-missing-shell".into();
+                }
+                Ok(())
+            })
+            .unwrap();
+        r.restore().unwrap();
+        let state = r.snapshot().unwrap();
+        assert!(state.sessions.iter().all(|s| s.status == "stopped"));
+        assert!(r.live.lock().unwrap().is_empty());
+        let chosen = state.sessions[0].id.clone();
+        let selected = r
+            .action(Action::SelectSession { id: chosen.clone() })
+            .unwrap();
+        assert_eq!(selected.active_session_id.as_deref(), Some(chosen.as_str()));
+        assert_eq!(selected.sessions[0].status, "error");
+        assert_eq!(selected.sessions[1].status, "stopped");
+        assert!(r.live.lock().unwrap().is_empty());
+        assert!(r
+            .action(Action::CompleteSetup {
+                cwd: temp.path().to_string_lossy().into()
+            })
+            .is_err());
+    }
+    #[test]
+    fn scoped_shell_cwd_does_not_overwrite_bound_provider_context() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let r = Runtime::new(temp.path().into(), None).unwrap();
+        let sid = r
+            .ledger
+            .lock()
+            .unwrap()
+            .change(|d| {
+                d.settings.default_cwd = temp.path().to_string_lossy().into();
+                shell::new_terminal(d, "work")
+            })
+            .unwrap();
+        let rollout = codex_rollout(temp.path(), "exact-thread", &["one", "two"], false);
+        r.apply_event(hooks::map_payload("ready", &serde_json::json!({"thread-id":"exact-thread","turn-id":"one","transcript_path":rollout,"cwd":project,"input-messages":["Explain this code"],"last-assistant-message":"Done"}), Some(sid.clone()))).unwrap();
+        let first = r.session(&sid).unwrap();
+        assert_eq!(first.provider, "codex");
+        assert_eq!(first.cwd, project.to_string_lossy());
+        assert_eq!(first.title, "Explain this code");
+        r.apply_event(HookEvent {
+            event: "shell_cwd".into(),
+            session_id: Some(sid.clone()),
+            cwd: Some(temp.path().to_string_lossy().into()),
+            ..Default::default()
+        })
+        .unwrap();
+        let returned = r.session(&sid).unwrap();
+        assert_eq!(returned.cwd, first.cwd);
+        assert_eq!(returned.shell_cwd, temp.path().to_string_lossy());
+        assert_eq!(returned.provider_session_id, first.provider_session_id);
+        r.apply_event(hooks::map_payload("ready", &serde_json::json!({"thread-id":"exact-thread","turn-id":"two","input-messages":["A later question"],"last-assistant-message":"Done"}), Some(sid.clone()))).unwrap();
+        assert_eq!(r.session(&sid).unwrap().title, "Explain this code");
+    }
+    #[test]
+    fn isolated_identifiers_are_stable_and_separate_data_directories() {
+        let base = "dev.relay.workspace";
+        assert_eq!(
+            isolated_identifier(base, Path::new("isolated/./one")),
+            isolated_identifier(base, Path::new("isolated/one"))
+        );
+        assert_ne!(
+            isolated_identifier(base, Path::new("isolated/one")),
+            isolated_identifier(base, Path::new("isolated/two"))
+        );
+    }
+    #[test]
+    fn stale_transcript_observer_cannot_change_a_fresh_launch() {
+        let temp = tempfile::tempdir().unwrap();
+        let r = Runtime::new(temp.path().into(), None).unwrap();
+        let sid = r
+            .ledger
+            .lock()
+            .unwrap()
+            .change(|d| {
+                d.settings.default_cwd = temp.path().to_string_lossy().into();
+                let sid = shell::new_terminal(d, "work")?;
+                let s = session_mut(d, &sid)?;
+                s.provider = "codex".into();
+                s.provider_session_id = Some("new-thread".into());
+                Ok(sid)
+            })
+            .unwrap();
+        let before = r.snapshot().unwrap().version;
+        r.apply_event(HookEvent {
+            event: "settings".into(),
+            session_id: Some(sid.clone()),
+            expected_provider_session_id: Some("old-thread".into()),
+            model: Some("stale-model".into()),
+            effort: Some("stale-effort".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(r.session(&sid).unwrap().model.is_empty());
+        assert_eq!(r.snapshot().unwrap().version, before);
+    }
     #[test]
     fn notifications_have_durable_own_tabs_read_is_not_dismissal_and_settings_are_noop() {
         let temp = tempfile::tempdir().unwrap();
@@ -1303,6 +1767,15 @@ mod tests {
         assert_eq!(s.sessions.len(), 1);
         assert_eq!(s.sessions[0].kind, "assistant");
         assert!(s.sessions[0].initial_prompt.contains("Meeting starts soon"));
+        runtime
+            .ledger
+            .lock()
+            .unwrap()
+            .change(|d| {
+                d.sessions[0].executable = "relay-test-missing-cli".into();
+                Ok(())
+            })
+            .unwrap();
         runtime
             .action(Action::OpenNotification {
                 id: s.notifications[0].id.clone(),

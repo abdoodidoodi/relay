@@ -3,6 +3,8 @@
 Relay is a small Tauri desktop app. Read README.md and docs/relay-contract.md first.
 
 - The active interface is src/relay/ and src/relay.css. The Rust backend is src-tauri/src/relay/.
+- Keep the normal flow shell-first: one folder setup, then immediate shell tabs. Do not add a provider/model launch form.
+- Restore saved tabs only when selected. Shell integration must stay scoped to that shell process; never edit global shell profiles or provider settings.
 - Keep agent processes in the Rust runtime. React teardown, tab switches and HMR must never stop a PTY.
 - Persist every meaningful metadata change transactionally before reporting success. Keep stable tab IDs independent from provider conversation IDs.
 - Never restore using a latest-session guess (--last/--continue). Do not silently replace a failed resume with a fresh conversation.
