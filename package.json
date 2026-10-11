@@ -20,7 +20,7 @@
     "tauri": "node scripts/relay-tool.mjs",
     "test": "vitest run",
     "test:startup": "node --test scripts/start.test.mjs",
-    "test:connectors": "node --test integrations",
+    "test:connectors": "node --test integrations/notify.test.mjs integrations/providers.test.mjs integrations/relay-mcp.test.mjs",
     "test:native": "node scripts/relay-tool.mjs native-test"
   },
   "dependencies": {
