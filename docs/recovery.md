@@ -57,6 +57,7 @@ The following checks passed on Windows during development of Relay 0.1.0:
 | Rust unit and integration tests | 22 passed for the shell-first runtime, including setup migration, lazy restore, separate shell/provider folders, stale transcript protection and hidden Codex title-thread exclusion |
 | Frontend tests | 18 passed |
 | Source startup tests | 2 passed |
+| `npm start` from source | Passed: automatic locked dependency installation, Vite startup, Rust build, folder setup and real PowerShell execution |
 | Connector tests using fake endpoints | 12 passed |
 | Native Rust compilation and debug build | Passed |
 | Real Windows ConPTY output and bounded replay | Passed; the startup cursor handshake works without a mounted frontend terminal |
@@ -66,12 +67,14 @@ The following checks passed on Windows during development of Relay 0.1.0:
 | Reminder persistence and one-time delivery across restart | Passed |
 | Selected conversation and notification dismissal after force-kill | Passed |
 | Windows release packaging | Produced an unsigned NSIS development installer |
+| Current Windows production executable | Built with `--no-bundle`; shell, Claude and Codex recovery smoke checks passed against the release executable |
+| Windows GUI-subsystem launch helper | Explicit UTF-8 pipe round-trip passed with Unicode paths, spaces and embedded quotes |
 | Shell-first Windows lifecycle | Passed 13 checks: folder setup, inline rename, immediate shell tabs, saved shell folder, HMR attachment, tray behavior, durable inbox/rules and lazy restore |
 | Live Claude Code 2.1.296 conversation recovery | Passed 13 checks after typing `claude-code` in PowerShell with provider defaults: actual response, exact ID, model/effort, title and group survived a forced app restart; clicking the saved tab resumed it, and a second turn recalled the earlier test phrase |
 | Live Codex 0.162.1 conversation recovery | Passed 13 checks after typing `codex` in PowerShell with provider defaults: exact ID/model/effort/title/group survived a forced app restart, clicking the saved tab resumed it, and a second turn recalled a unique test phrase; background title notifications left its identity intact |
 
 Rust tests also cover database reopen, transaction rollback, durable event deduplication, exact resume arguments, provider payload mapping, hook authentication, conversation-binding uniqueness, assistant notification context, repeated-rule scheduling, and timeout enforcement when a command closes stdout before exiting.
 
-The live Claude and Codex checks used the installed, authenticated CLIs in isolated working folders with harmless two-turn memory checks and no agent tool actions. macOS is configured as a build target but has not yet been built or tested in this workspace. Windows results should not be treated as macOS verification. A forced process restart was tested; the laptop itself was not rebooted.
+The live Claude and Codex checks used the installed, authenticated CLIs in isolated working folders with harmless two-turn memory checks and no agent tool actions. macOS automated tests and the production build passed on GitHub Actions; interactive terminal and live agent recovery have only been verified on Windows. A forced process restart was tested; the laptop itself was not rebooted.
 
 Re-run the Windows application smoke check with `node scripts/smoke-native.mjs` (debug build plus the Vite server), or set `RELAY_QA_BINARY=src-tauri/target/release/relay.exe` to test the packaged application. `node scripts/smoke-claude.mjs` and `node scripts/smoke-codex.mjs` are opt-in live provider checks: each requires its authenticated CLI and uses two short model turns. All three use fresh Windows temporary directories outside the source repository, so a folder-trust decision cannot apply to the source repository. They leave your normal Relay workspace untouched.

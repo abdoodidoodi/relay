@@ -577,10 +577,42 @@ function Invoke-RelayPrepared($Launch) {{
     $proc.WaitForExit()
     $global:LASTEXITCODE = $proc.ExitCode
 }}
+function Invoke-RelayPrepare([string]$Provider, [string[]]$Forwarded) {{
+    # PowerShell does not capture a GUI-subsystem executable through its normal
+    # native pipeline reliably. Explicit handles work in both debug and release.
+    $info = New-Object System.Diagnostics.ProcessStartInfo
+    $info.FileName = $script:RelayBinary
+    $info.Arguments = '--relay-prepare ' + $Provider
+    $info.WorkingDirectory = $PWD.ProviderPath
+    $info.UseShellExecute = $false
+    $info.CreateNoWindow = $true
+    $info.RedirectStandardInput = $true
+    $info.RedirectStandardOutput = $true
+    $info.RedirectStandardError = $true
+    $info.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+    $info.StandardErrorEncoding = [System.Text.Encoding]::UTF8
+    $proc = [System.Diagnostics.Process]::Start($info)
+    $out = $proc.StandardOutput.ReadToEndAsync()
+    $err = $proc.StandardError.ReadToEndAsync()
+    $inputWriter = [System.IO.StreamWriter]::new($proc.StandardInput.BaseStream, [System.Text.UTF8Encoding]::new($false))
+    $inputWriter.WriteLine((ConvertTo-Json -InputObject @($Forwarded) -Compress))
+    $inputWriter.Close()
+    if (!$proc.WaitForExit(15000)) {{
+        $proc.Kill()
+        $global:LASTEXITCODE = 1
+        Write-Error 'Relay provider preparation timed out.'
+        return
+    }}
+    $global:LASTEXITCODE = $proc.ExitCode
+    $raw = $out.GetAwaiter().GetResult()
+    $errorText = $err.GetAwaiter().GetResult()
+    if ($global:LASTEXITCODE -ne 0) {{ Write-Error $errorText; return }}
+    if (!$raw) {{ $global:LASTEXITCODE = 1; Write-Error 'Relay provider preparation returned no arguments.'; return }}
+    $raw
+}}
 function Invoke-RelayAgent([string]$Provider, [string[]]$Forwarded) {{
-    $json = ConvertTo-Json -InputObject @($Forwarded) -Compress
-    $raw = $json | & $script:RelayBinary --relay-prepare $Provider --cwd $PWD.ProviderPath
-    if ($LASTEXITCODE -ne 0 -or !$raw) {{ return }}
+    $raw = Invoke-RelayPrepare $Provider @($Forwarded)
+    if ($global:LASTEXITCODE -ne 0 -or !$raw) {{ return }}
     Invoke-RelayPrepared ($raw | ConvertFrom-Json)
     $agentExitCode = $global:LASTEXITCODE
     & $script:RelayBinary --relay-shell $PWD.ProviderPath
@@ -602,14 +634,18 @@ function global:prompt {{
             binary = ps_quote(&binary.to_string_lossy()),
             startup = if startup.is_some() {
                 format!(
-                    "Invoke-RelayPrepared (Get-Content -Raw -LiteralPath {} | ConvertFrom-Json)",
+                    "Invoke-RelayPrepared (Get-Content -Raw -Encoding UTF8 -LiteralPath {} | ConvertFrom-Json)",
                     ps_quote(&startup_path.to_string_lossy())
                 )
             } else {
                 String::new()
             }
         );
-        hooks::private_write(&script, text.as_bytes())?;
+        // Windows PowerShell 5 treats a BOM-less script as ANSI. Keep literal
+        // executable and private-file paths intact for non-ASCII account names.
+        let mut bytes = vec![0xef, 0xbb, 0xbf];
+        bytes.extend_from_slice(text.as_bytes());
+        hooks::private_write(&script, &bytes)?;
         return Ok((
             exe,
             vec![
